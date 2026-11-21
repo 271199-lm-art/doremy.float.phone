@@ -656,6 +656,25 @@
   border: 0.5px solid var(--c-input-border);
   border-radius: var(--ui-radius-card);
   background: color-mix(in srgb, var(--c-card) 60%, transparent);
+  /* 打字性能：高度固定（约两行），更长的内容在框内滚动。
+     绝不按内容测量 scrollHeight——那会在每次按键时强制重排整页，
+     是 Android WebView 里长会话打字卡顿的主因。 */
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  contain: layout paint style;
+}
+
+/* 输入条原本盖在大面积模糊背景上，WebView 每次重绘都要重新合成这层 blur。
+   小屏/触屏设备改为不透明底，打字与滚动都会明显更跟手。 */
+@media (max-width: 560px), (pointer: coarse) {
+  .chat-input-bar {
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+    background: var(--c-input, var(--c-page-body-bg)) !important;
+  }
 }
 
 .chat-theater-mode-strip {

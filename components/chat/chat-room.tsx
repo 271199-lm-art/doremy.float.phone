@@ -721,8 +721,8 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     // 下游（发送按钮、表情联想）按帧批量同步，组词期间完全不同步。
     const liveTextRef = useRef("");
     const composingRef = useRef(false);
-    const syncRafRef = useRef<number | null>(null);
-    const heightRafRef = useRef<number | null>(null);
+    const syncTimerRef = useRef<number | null>(null);
+    const sendBtnRef = useRef<HTMLButtonElement | null>(null);
 
     // 表情包搜索联想：ESC/失焦置 true 隐藏，输入变化重新开启
     const [suggestClosed, setSuggestClosed] = useState(false);
@@ -736,49 +736,51 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     const muteRemainingMs = muteUntilMs > muteNowTick ? muteUntilMs - muteNowTick : 0;
     const inputLocked = isSpectator || muteRemainingMs > 0;
 
+    // 输入框高度固定（超长时框内滚动），打字过程中完全不读取 scrollHeight：
+    // 在 Android WebView 里，输入区内每按一次键就强制重排一次整页，是打字卡顿的第一元凶。
     const resetTextareaHeight = () => {
-        if (textareaRef.current) {
-            textareaRef.current.style.height = "auto";
-            delete textareaRef.current.dataset.measuredLen;
-        }
+        if (textareaRef.current) delete textareaRef.current.dataset.measuredLen;
     };
 
-    /** 高度自适应合并到下一帧，且文本长度没变就跳过——避免每次按键都触发重排。 */
-    const scheduleHeight = useCallback(() => {
-        if (heightRafRef.current !== null) return;
-        heightRafRef.current = requestAnimationFrame(() => {
-            heightRafRef.current = null;
-            const ta = textareaRef.current;
-            if (!ta) return;
-            const len = String(ta.value.length);
-            if (ta.dataset.measuredLen === len) return;
-            ta.dataset.measuredLen = len;
-            ta.style.height = "auto";
-            ta.style.height = `${Math.min(ta.scrollHeight, 120)}px`;
-        });
+    /** 文本同步改为「打字停手后才同步」：连续输入期间不触发任何 React 渲染。 */
+    const syncComposerState = useCallback((immediate?: boolean) => {
+        const run = () => {
+            setInputText(prev => (prev === liveTextRef.current ? prev : liveTextRef.current));
+        };
+        if (syncTimerRef.current !== null) {
+            window.clearTimeout(syncTimerRef.current);
+            syncTimerRef.current = null;
+        }
+        if (immediate) {
+            run();
+            return;
+        }
+        syncTimerRef.current = window.setTimeout(() => {
+            syncTimerRef.current = null;
+            run();
+        }, 220);
     }, []);
 
-    /** 把 ref 里的最新文本按帧同步给 React 状态（发送按钮、联想面板据此更新）。 */
-    const syncComposerState = useCallback(() => {
-        if (syncRafRef.current !== null) return;
-        syncRafRef.current = requestAnimationFrame(() => {
-            syncRafRef.current = null;
-            setInputText(prev => (prev === liveTextRef.current ? prev : liveTextRef.current));
-        });
-    }, []);
+    /** 发送按钮的可用态直接改 DOM 属性，不经过 React 状态，避免每个字符一次渲染。 */
+    const refreshSendButton = useCallback(() => {
+        const btn = sendBtnRef.current;
+        if (!btn) return;
+        const hasText = liveTextRef.current.trim().length > 0;
+        // 生成中按钮是「停止」，始终可点；否则锁定或无文字时不可点。
+        btn.disabled = isGenerating ? false : (inputLocked || !hasText);
+    }, [isGenerating, inputLocked]);
 
     const setComposerText = useCallback((next: string, options?: { focus?: boolean }) => {
         liveTextRef.current = next;
         const ta = textareaRef.current;
         if (ta && ta.value !== next) ta.value = next;
-        syncComposerState();
-        scheduleHeight();
+        syncComposerState(true);
+        refreshSendButton();
         if (options?.focus !== false) ta?.focus();
-    }, [scheduleHeight, syncComposerState]);
+    }, [refreshSendButton, syncComposerState]);
 
     useEffect(() => () => {
-        if (syncRafRef.current !== null) cancelAnimationFrame(syncRafRef.current);
-        if (heightRafRef.current !== null) cancelAnimationFrame(heightRafRef.current);
+        if (syncTimerRef.current !== null) window.clearTimeout(syncTimerRef.current);
     }, []);
 
     const appendText = useCallback((text: string, options?: { focus?: boolean }) => {
@@ -881,17 +883,17 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                 defaultValue=""
                 onChange={e => {
                     liveTextRef.current = e.target.value;
+                    refreshSendButton();
                     // 组词过程中不同步状态，避免打断中文输入法的候选与光标。
                     if (!composingRef.current) syncComposerState();
-                    scheduleHeight();
                     setSuggestClosed(false);
                 }}
                 onCompositionStart={() => { composingRef.current = true; }}
                 onCompositionEnd={e => {
                     composingRef.current = false;
                     liveTextRef.current = e.currentTarget.value;
-                    syncComposerState();
-                    scheduleHeight();
+                    refreshSendButton();
+                    syncComposerState(true);
                 }}
                 onFocus={(e) => {
                     if (panelOpen) {
@@ -943,6 +945,7 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="16" /><line x1="8" y1="12" x2="16" y2="12" /></svg>
                 </button>
                 <button
+                    ref={sendBtnRef}
                     onClick={handleSubmit}
                     onPointerDown={(e) => e.preventDefault()}
                     tabIndex={-1}
@@ -1050,35 +1053,52 @@ const OfflineTextInputBar = memo(forwardRef<OfflineTextInputHandle, {
     const [inputText, setInputText] = useState("");
     const inputTextRef = useRef("");
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-    // 与主输入框一致：非受控 + 按帧同步，避免 WebView 里每敲一个字就重设 value/重排。
+    // 与主输入框一致：非受控 + 打字期间零重排、零渲染。
     const composingRef = useRef(false);
-    const syncRafRef = useRef<number | null>(null);
+    const syncTimerRef = useRef<number | null>(null);
+    const sendBtnRef = useRef<HTMLButtonElement | null>(null);
 
-    const syncComposerState = useCallback(() => {
-        if (syncRafRef.current !== null) return;
-        syncRafRef.current = requestAnimationFrame(() => {
-            syncRafRef.current = null;
+    const syncComposerState = useCallback((immediate?: boolean) => {
+        const run = () => {
             setInputText(prev => (prev === inputTextRef.current ? prev : inputTextRef.current));
-        });
+        };
+        if (syncTimerRef.current !== null) {
+            window.clearTimeout(syncTimerRef.current);
+            syncTimerRef.current = null;
+        }
+        if (immediate) {
+            run();
+            return;
+        }
+        syncTimerRef.current = window.setTimeout(() => {
+            syncTimerRef.current = null;
+            run();
+        }, 220);
     }, []);
+
+    const refreshSendButton = useCallback(() => {
+        const btn = sendBtnRef.current;
+        if (!btn) return;
+        const hasText = inputTextRef.current.trim().length > 0;
+        btn.disabled = isOfflineGenerating ? false : (isSpectator || !hasText);
+    }, [isOfflineGenerating, isSpectator]);
 
     /** 写入文本：同时落到 DOM，保证显示与内部值一致。 */
     const writeTextareaValue = useCallback((text: string) => {
         inputTextRef.current = text;
         const ta = textareaRef.current;
         if (ta && ta.value !== text) ta.value = text;
-        syncComposerState();
-    }, [syncComposerState]);
+        syncComposerState(true);
+        refreshSendButton();
+    }, [refreshSendButton, syncComposerState]);
 
     const resetTextareaHeight = () => {
-        if (textareaRef.current) textareaRef.current.style.height = "auto";
+        if (textareaRef.current) textareaRef.current.scrollTop = 0;
     };
 
     const resizeTextarea = useCallback(() => {
-        const ta = textareaRef.current;
-        if (!ta) return;
-        ta.style.height = "auto";
-        ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
+        // 高度固定，框内滚动：不再测量 scrollHeight，避免每次按键重排。
+        if (textareaRef.current) textareaRef.current.scrollTop = 0;
     }, []);
 
     const setTextAndResize = useCallback((text: string) => {
@@ -1126,15 +1146,15 @@ const OfflineTextInputBar = memo(forwardRef<OfflineTextInputHandle, {
                 defaultValue=""
                 onChange={e => {
                     inputTextRef.current = e.target.value;
+                    refreshSendButton();
                     if (!composingRef.current) syncComposerState();
-                    e.target.style.height = "auto";
-                    e.target.style.height = `${Math.min(e.target.scrollHeight, 120)}px`;
                 }}
                 onCompositionStart={() => { composingRef.current = true; }}
                 onCompositionEnd={e => {
                     composingRef.current = false;
                     inputTextRef.current = e.currentTarget.value;
-                    syncComposerState();
+                    refreshSendButton();
+                    syncComposerState(true);
                 }}
                 onFocus={(e) => {
                     if (showEmojiPanel) {
@@ -1181,6 +1201,7 @@ const OfflineTextInputBar = memo(forwardRef<OfflineTextInputHandle, {
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><path d="M8 14s1.5 2 4 2 4-2 4-2" /><line x1="9" y1="9" x2="9.01" y2="9" /><line x1="15" y1="9" x2="15.01" y2="9" /></svg>
                 </button>
                 <button
+                    ref={sendBtnRef}
                     type="button"
                     onClick={() => { if (isOfflineGenerating) onStopGeneration(); else handleSubmit(); }}
                     onPointerDown={(e) => e.preventDefault()}
