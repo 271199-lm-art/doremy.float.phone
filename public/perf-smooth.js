@@ -14,7 +14,7 @@ export default {
     id: "perf-smooth",
     name: "流畅模式",
     apiVersion: 1,
-    version: "1.0.0",
+    version: "1.1.0",
     author: "豆包",
     description:
       "关闭毛玻璃模糊与装饰动效、输入条独立合成层，降低 Android WebView 打字与滚动的重绘开销。",
@@ -80,6 +80,26 @@ export default {
 
     // 打字延迟自检：从 input 事件到两帧后真正画出来花了多久。
     // 只在日志里记录中位数，不打扰界面，用来判断还有没有别的东西在拖后腿。
+    // 长任务探针：记录每次超过 150ms 的主线程阻塞，以及它的来源脚本。
+    // 打字"中位数很稳但偶尔抽一下"就是这种长任务造成的。
+    let longTaskObserver = null;
+    const onLongTask = list => {
+      for (const entry of list.getEntries()) {
+        if (entry.duration < 150) continue;
+        const attribution = (entry.attribution || [])
+          .map(item => item.name || item.containerType || item.containerSrc || "?")
+          .filter(Boolean)
+          .join(", ");
+        log(`长任务 ${Math.round(entry.duration)}ms 起始 ${Math.round(entry.startTime)}ms 来源 ${attribution || "未知"}`);
+      }
+    };
+    try {
+      if (typeof PerformanceObserver !== "undefined") {
+        longTaskObserver = new PerformanceObserver(onLongTask);
+        longTaskObserver.observe({ type: "longtask", buffered: false });
+      }
+    } catch { /* 环境不支持就算了 */ }
+
     let samples = [];
     let seq = 0;
     const onInput = event => {
@@ -105,6 +125,7 @@ export default {
 
     return () => {
       document.removeEventListener("input", onInput, true);
+      try { longTaskObserver && longTaskObserver.disconnect(); } catch { /* 忽略 */ }
       try { offSettings && offSettings(); } catch { /* 忽略 */ }
       root.removeAttribute(HTML_FLAG);
       style && style.remove();
