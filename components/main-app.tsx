@@ -236,6 +236,22 @@ export function MainApp() {
   const [kvHydrateFailed, setKvHydrateFailed] = useState(false);
   const [initAttempt, setInitAttempt] = useState(0);
 
+  // 流畅模式：触屏设备默认给 <html> 打上 data-perf-lite="1"，
+  // 由 styles/perf-lite.css 关闭毛玻璃与装饰动效（见该文件头注释）。
+  useEffect(() => {
+    const mq = window.matchMedia("(pointer: coarse)");
+    const apply = () => {
+      if (mq.matches) {
+        document.documentElement.dataset.perfLite = "1";
+      } else {
+        delete document.documentElement.dataset.perfLite;
+      }
+    };
+    apply();
+    mq.addEventListener?.("change", apply);
+    return () => mq.removeEventListener?.("change", apply);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 

@@ -1,0 +1,42 @@
+/*
+  流畅模式（perf-lite）
+  ===================
+  触屏设备默认开启：给 <html> 打上 data-perf-lite="1"。
+
+  为什么要这么做：Android WebView 里，页面里只要还有大面积的
+  backdrop-filter（毛玻璃），每次重绘（打字、滚动、键盘弹起）都要重新
+  合成这些模糊层，这是长会话下输入卡顿的主要来源。装饰性动画/过渡同理，
+  它们会让 WebView 每帧都忙，键盘事件就排队。
+
+  这一层只做「减法」：不减内容、不改布局，只把模糊与动效关掉，
+  所以出问题的风险低，也随时可以去掉。
+*/
+
+/* 1) 全局关闭毛玻璃模糊 */
+html[data-perf-lite="1"] .app-root *,
+html[data-perf-lite="1"] .app-root *::before,
+html[data-perf-lite="1"] .app-root *::after {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/* 2) 关闭装饰性动画与过渡（保留极短的过渡，避免状态切换显得突兀） */
+html[data-perf-lite="1"] .app-root *,
+html[data-perf-lite="1"] .app-root *::before,
+html[data-perf-lite="1"] .app-root *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.04s !important;
+}
+
+/* 3) 输入条独立成合成层：打字时的重绘只影响这一小块，
+      不再牵动整页的消息列表。 */
+html[data-perf-lite="1"] .chat-input-bar {
+  transform: translateZ(0);
+  contain: layout style paint;
+}
+
+html[data-perf-lite="1"] .chat-input-bar .chat-input-textarea {
+  transform: translateZ(0);
+  touch-action: manipulation;
+}
