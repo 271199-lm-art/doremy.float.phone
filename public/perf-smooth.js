@@ -1,10 +1,12 @@
-// 流畅模式 · 小手机聊天插件（apiVersion 1）
+// 流畅模式 v2 · 小手机聊天插件（apiVersion 1）
 //
-// 作用：把「让 WebView 每次重绘都要重新合成的大面积毛玻璃」和装饰动效关掉，
-// 并把聊天输入条独立成一个合成层。全是减法：不改数据、不改布局、不联网。
-// 卸载后在 setup 返回的清理函数里全部还原。
+// 做三件事：
+//  1) 关掉大面积毛玻璃与装饰动效（WebView 里最贵的合成开销）
+//  2) 消息列表离屏不渲染（content-visibility），长会话滚动/重绘大降
+//  3) 在你操作时采样帧率，把「帧率 / 长卡顿次数 / 最长卡顿」写进插件日志
+//     —— 用来判断到底是「渲染慢（帧率低）」还是「JS 阻塞（整段卡住）」
 //
-// 安装：聊天设置 →「扩展插件」→「导入插件」（选本文件），或把整段代码粘贴进去。
+// 安装：聊天设置 →「扩展插件」→「导入插件」选本文件，或粘贴整段代码。
 
 const STYLE_ID = "perf-smooth-plugin-style";
 const HTML_FLAG = "data-perf-smooth";
@@ -14,20 +16,22 @@ export default {
     id: "perf-smooth",
     name: "流畅模式",
     apiVersion: 1,
-    version: "1.1.0",
+    version: "2.0.0",
     author: "豆包",
     description:
-      "关闭毛玻璃模糊与装饰动效、输入条独立合成层，降低 Android WebView 打字与滚动的重绘开销。",
+      "关闭毛玻璃与装饰动效、消息列表离屏不渲染，并采样帧率/卡顿写进日志，便于定位全局卡的来源。",
     permissions: ["ui"],
     settings: [
       { key: "blur", label: "关闭毛玻璃模糊（最有效）", type: "boolean", default: true },
       { key: "anim", label: "关闭装饰动效与长过渡", type: "boolean", default: true },
       { key: "composer", label: "输入条独立合成层", type: "boolean", default: true },
-      { key: "probe", label: "统计打字响应延迟（写进插件日志）", type: "boolean", default: true },
+      { key: "offscreen", label: "消息列表离屏不渲染", type: "boolean", default: true },
+      { key: "probe", label: "采样帧率与卡顿（写进插件日志）", type: "boolean", default: true },
     ],
   },
   setup(ctx) {
     const root = document.documentElement;
+
     const read = (key, fallback) => {
       try {
         const value = ctx.system.settings.get(key);
@@ -68,64 +72,71 @@ export default {
           `html[${HTML_FLAG}="1"] .chat-input-textarea{transform:translateZ(0);contain:layout paint style;touch-action:manipulation}`,
         );
       }
+      if (read("offscreen", true)) {
+        // 关键：把每条消息变成「离屏不参与布局/绘制」的容器。
+        // 长会话里几十上百条消息时，这一步能直接砍掉大部分重排成本。
+        parts.push(
+          `html[${HTML_FLAG}="1"] .chat-msg-wrapper{content-visibility:auto;contain-intrinsic-size:auto 140px}`,
+        );
+      }
       style.textContent = parts.join("\n");
     };
     render();
 
-    // 设置变更时立即重算样式
     let offSettings = null;
-    try {
-      offSettings = ctx.system.settings.onChange(() => render());
-    } catch { /* 没有订阅能力就靠下次启用生效 */ }
+    try { offSettings = ctx.system.settings.onChange(() => render()); } catch { /* 忽略 */ }
 
-    // 打字延迟自检：从 input 事件到两帧后真正画出来花了多久。
-    // 只在日志里记录中位数，不打扰界面，用来判断还有没有别的东西在拖后腿。
-    // 长任务探针：记录每次超过 150ms 的主线程阻塞，以及它的来源脚本。
-    // 打字"中位数很稳但偶尔抽一下"就是这种长任务造成的。
-    let longTaskObserver = null;
-    const onLongTask = list => {
-      for (const entry of list.getEntries()) {
-        if (entry.duration < 150) continue;
-        const attribution = (entry.attribution || [])
-          .map(item => item.name || item.containerType || item.containerSrc || "?")
-          .filter(Boolean)
-          .join(", ");
-        log(`长任务 ${Math.round(entry.duration)}ms 起始 ${Math.round(entry.startTime)}ms 来源 ${attribution || "未知"}`);
-      }
-    };
-    try {
-      if (typeof PerformanceObserver !== "undefined") {
-        longTaskObserver = new PerformanceObserver(onLongTask);
-        longTaskObserver.observe({ type: "longtask", buffered: false });
-      }
-    } catch { /* 环境不支持就算了 */ }
-
+    // ── 采样：操作期间测 2 秒的帧间隔 ─────────────────────────
+    // 帧率低 = 渲染/绘制太重；出现一次几百毫秒的空档 = JS 主线程被阻塞。
+    let sampling = false;
+    let batch = 0;
     let samples = [];
-    let seq = 0;
+
+    const summarize = () => {
+      const gaps = samples.slice();
+      if (!gaps.length) return;
+      const total = gaps.reduce((a, b) => a + b, 0);
+      const avgFps = Math.round((gaps.length / total) * 1000);
+      const longFrames = gaps.filter(g => g > 50).length;
+      const worst = Math.round(Math.max.apply(null, gaps));
+      batch += 1;
+      log(`帧率 ${avgFps}fps / 掉帧 ${longFrames} 次 / 最长卡顿 ${worst}ms（第 ${batch} 批）`);
+      samples = [];
+    };
+
+    const startSample = () => {
+      if (sampling || read("probe", true) === false) return;
+      sampling = true;
+      samples = [];
+      let last = performance.now();
+      const deadline = last + 2000;
+      const step = now => {
+        if (now > deadline) {
+          sampling = false;
+          summarize();
+          return;
+        }
+        samples.push(now - last);
+        last = now;
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    };
+
+    const onTouch = () => startSample();
     const onInput = event => {
       const target = event.target;
       if (!target || typeof target.closest !== "function") return;
       if (!target.closest("textarea, input[type=text]")) return;
-      if (read("probe", true) === false) return;
-      const t0 = performance.now();
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          samples.push(performance.now() - t0);
-          if (samples.length < 20) return;
-          const sorted = samples.slice().sort((a, b) => a - b);
-          const median = Math.round(sorted[Math.floor(sorted.length / 2)]);
-          const worst = Math.round(sorted[sorted.length - 1]);
-          seq += 1;
-          log(`打字响应 中位数 ${median}ms / 最慢 ${worst}ms（第 ${seq} 批）`);
-          samples = [];
-        });
-      });
+      startSample();
     };
+
+    document.addEventListener("touchstart", onTouch, { capture: true, passive: true });
     document.addEventListener("input", onInput, true);
 
     return () => {
+      document.removeEventListener("touchstart", onTouch, { capture: true });
       document.removeEventListener("input", onInput, true);
-      try { longTaskObserver && longTaskObserver.disconnect(); } catch { /* 忽略 */ }
       try { offSettings && offSettings(); } catch { /* 忽略 */ }
       root.removeAttribute(HTML_FLAG);
       style && style.remove();
